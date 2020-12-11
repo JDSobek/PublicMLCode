@@ -14,8 +14,8 @@ def cover_patch(image_tensor: torch.Tensor) -> torch.Tensor:
     num_covers = randint(1,5)
     covered_image = torch.clone(image_tensor)
     for i in range(num_covers):
-        patch_x_len = randint(math.floor(image_x_len/8), math.floor((image_x_len/4)))
-        patch_y_len = randint(math.floor(image_y_len/8), math.floor((image_y_len/4)))
+        patch_x_len = randint(math.floor(image_x_len/5), math.floor((image_x_len/3)))
+        patch_y_len = randint(math.floor(image_y_len/5), math.floor((image_y_len/3)))
         patch_x_start = randint(0, image_x_len-patch_x_len-1)
         patch_y_start = randint(0, image_y_len-patch_y_len-1)
         covered_image[:, patch_x_start:patch_x_start+patch_x_len, patch_y_start:patch_y_start+patch_y_len] = torch.zeros(size=[channels, patch_x_len, patch_y_len])
@@ -25,8 +25,10 @@ def cover_patch(image_tensor: torch.Tensor) -> torch.Tensor:
 def gramMatrix(activations: torch.Tensor) -> torch.Tensor:
     """Calculates the Gram matrix for a 3-D tensor (Channels, height, width)
      using the efficient method suggested in https://arxiv.org/pdf/1603.08155.pdf"""
-    batch, channels, _, _ = activations.size()
-    norm_factor = 1./torch.numel(activations)
+    batch, channels, width, height = activations.size()
+    # trying different normalizations to handle contributions being different at different layers in the
+    # reference network, normalization for batch and channels handled outside this calculation
+    norm_factor = 1./(width*height)#/torch.numel(activations)
     flattened_activations = torch.reshape(activations, (batch*channels, -1,))
     gram_matrix = norm_factor*torch.matmul(flattened_activations, flattened_activations.t())
     return gram_matrix
@@ -37,13 +39,15 @@ def layerStyleLoss(pred_activations: torch.Tensor, target_activations: torch.Ten
     Activations must be 4-D tensors in (batch, channels, height, width) format."""
     if pred_activations.size()[0] != target_activations.size()[0] or pred_activations.size()[1] != target_activations.size()[1]:
         raise AttributeError("Both sets of activations must have the same number of channels and equal batch size.")
+    # print("activation tensor size:")
+    # print(pred_activations.size())
     pred_gram = gramMatrix(pred_activations)
     target_gram = gramMatrix(target_activations)
     gram_diff = torch.sub(pred_gram, target_gram)
-    # going to use the mean instead of the proper squared frobenius norm to address what happens when adding losses
-    # calculated from different sized tensors, not sure if it helps as gramMatrix should already account for it
-    squared_frob_norm = torch.sum(torch.square(gram_diff))
-    #squared_frob_norm = torch.mean(torch.square(gram_diff))
+    # using the sum creates much more drastic effect than taking the mean
+    # it's not clear which is better, size relative to the content loss at each layer is highly variable
+    #squared_frob_norm = torch.sum(torch.square(gram_diff))
+    squared_frob_norm = torch.mean(torch.square(gram_diff))
     return squared_frob_norm
 
 
@@ -52,7 +56,7 @@ class CustomDataset(data.Dataset):
     def __init__(self, data_dir):
         #tensor_dir = data_dir
         content_dir = data_dir
-        self.transforms = torchvision.transforms.Compose([#torchvision.transforms.RandomAffine(15),
+        self.transforms = torchvision.transforms.Compose([torchvision.transforms.RandomAffine(10),
                                                         torchvision.transforms.Resize(256),
                                                         torchvision.transforms.RandomCrop(256),
                                                         torchvision.transforms.ToTensor(),
@@ -219,22 +223,29 @@ class PerceptualLoss(_Loss):
         for param in self.ref_model.parameters():
             param.requires_grad_(False)
 
-        transforms = torchvision.transforms.Compose([torchvision.transforms.ToTensor(),
+        self.transforms = torchvision.transforms.Compose([torchvision.transforms.ToTensor(),
                                                      torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                                                      ])
 
         # this code won't work with more than one style target but doing it this way lets me avoid hardcoding a filename
+        # for dirpath, subdirs, files in os.walk(self.style_path):
+        #     for file in files:
+        #         style_img = Image.open(dirpath+file).convert('RGB')
+        #         style_img = self.transforms(style_img).cuda()
+        #         # doesn't go out of scope because python
+        #         self.style_target = torch.unsqueeze(style_img, dim=0)
+
+        self.style_dict = {}
         for dirpath, subdirs, files in os.walk(self.style_path):
             for file in files:
-                style_img = Image.open(dirpath+file).convert('RGB')
-                style_img = transforms(style_img).cuda()
-                # doesn't go out of scope because python
-                self.style_target = torch.unsqueeze(style_img, dim=0)
+                key = file
+                self.style_dict[key] = os.path.join(dirpath, file)
+        self.style_keys = list(self.style_dict.keys())
+        self.style_len = len(self.style_keys)
 
-        # layers to calculate loss at
+        # layers at which we will calculate loss
         # layers just before max pooling layers: 34, 25, 16, 7, 2
-        # maybe use layers just after max pool layers instead of just before
-        # this dictionary format will probably only work for vgg, would like to make it work for resnet
+        # this dictionary format will probably only work for vgg, would like to make it work for resnet too
         # entries formatted as below
         # layer: (layer content weight, layer style weight)
         self.layers = {
@@ -245,15 +256,26 @@ class PerceptualLoss(_Loss):
         }
 
     def forward(self, preds, target):
+        #scale_factor = 1. # doesn't do anything important, just makes things more readable
         batch_loss = 0.
+        mse_reduce = 'mean'
+
+        # note class variables shouldn't normally be declared outside __init__ but i want to maximize ability
+        # to try new methodologies while I test and this is the easiest way to allow me to switch methods
+        style_index = randint(0, self.style_len-1)
+        style_img = Image.open(self.style_dict[self.style_keys[style_index]]).convert('RGB')
+        self.style_target = torch.unsqueeze(self.transforms(style_img).cuda(), dim=0)
+
         # this is necessary for the Gram matrices to be calculated without flattening along the batch axis
-        batch_size = preds.size()[0]
+        batch_size, channel_num, _, _ = preds.size()
         style_target = self.style_target.repeat(batch_size, 1, 1, 1)
 
         # calculate the loss for the output of the network
-        output_style_loss = layerStyleLoss(preds, style_target)
-        output_content_loss = torch.nn.functional.mse_loss(preds, target)
+        output_style_loss = layerStyleLoss(preds, style_target) /(batch_size * channel_num) # *scale_factor/torch.numel(preds)
+        output_content_loss = torch.nn.functional.mse_loss(preds, target, reduction=mse_reduce) /(batch_size * channel_num) #*scale_factor/torch.numel(preds)
+        # print("content loss at output:")
         # print(output_content_loss)
+        # print("style loss at output:")
         # print(output_style_loss)
         batch_loss += output_content_loss + output_style_loss
 
@@ -262,18 +284,22 @@ class PerceptualLoss(_Loss):
             ref_target = self.ref_model[:layer+1](target)
             ref_preds = self.ref_model[:layer+1](preds)
             ref_style = self.ref_model[:layer+1](style_target)
-            ref_content_loss = torch.nn.functional.mse_loss(ref_preds, ref_target)
-            ref_style_loss = layerStyleLoss(ref_preds, ref_style)
+            batch_size, channel_num, _, _ = ref_preds.size()
+            ref_content_loss = torch.nn.functional.mse_loss(ref_preds, ref_target, reduction=mse_reduce) /(batch_size * channel_num) # *scale_factor/torch.numel(ref_preds)
+            ref_style_loss = layerStyleLoss(ref_preds, ref_style) /(batch_size * channel_num) # *scale_factor/torch.numel(ref_preds)
+            # print("layer " +  str(layer))
+            # print("content loss at layer " + str(layer))
             # print(ref_content_loss)
+            # print("style loss at layer" + str(layer))
             # print(ref_style_loss)
+            # multiplying by respective weights
             batch_loss += self.layers[layer][0]*ref_content_loss + self.layers[layer][0]*ref_style_loss
 
         return batch_loss
 
 
 if __name__ == '__main__':
-    # probably needs a pretrained network to get decent results
-
+    num_epochs = 1000
     # relevant directories
     # parent_path = r"C:\Users\Joe\Pictures\style_transfer\\"
     content_path = r"C:\Users\Joe\Pictures\style_transfer\content2\\"
@@ -287,9 +313,8 @@ if __name__ == '__main__':
     #print(net)
 
     # create the train and validation datasets
-    batchsize = 4
-    train_bs = batchsize
-    val_bs = batchsize
+    train_bs = 2
+    val_bs = 2
     trainset = CustomDataset(train_path)
     testset = CustomDataset(test_path)
     # create dataloaders from the datasets
@@ -301,12 +326,13 @@ if __name__ == '__main__':
     criterion = PerceptualLoss(style_path=style_path)
     #optimizer = torch.optim.SGD(net.parameters(), lr=0.003, momentum=0.3)
     optimizer = torch.optim.Adam(net.parameters(), lr=0.003)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=400, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.03, epochs=num_epochs, steps_per_epoch=len(trainloader))
 
     print('Beginning Training')
     # define the training loop and train the model
     loss_accum_size = 1 # print training loss after every batch
-    for epoch in range(300):
+    for epoch in range(num_epochs):
         running_loss = 0.0
         for i, data in enumerate(trainloader, 0):
             inputs, targets = data
@@ -316,7 +342,7 @@ if __name__ == '__main__':
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-
+            scheduler.step()
             running_loss += loss.item()
             # print training loss
             if i % loss_accum_size == 0:
@@ -333,8 +359,8 @@ if __name__ == '__main__':
             val_counter += 1
         # print validation loss
         print('[%d, %5d] val loss: %.3f' % (epoch + 1, i + 1, val_loss / val_counter))
-
-        scheduler.step()
+        # one-cycle scheduler steps every batch not every epoch
+        #scheduler.step()
 
     print('Finished Training')
 
