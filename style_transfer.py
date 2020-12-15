@@ -23,12 +23,12 @@ def cover_patch(image_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def gramMatrix(activations: torch.Tensor) -> torch.Tensor:
-    """Calculates the Gram matrix for a 3-D tensor (Channels, height, width)
+    """Calculates the Gram matrix for a 4-D tensor (batch, channels, height, width)
      using the efficient method suggested in https://arxiv.org/pdf/1603.08155.pdf"""
-    batch, channels, width, height = activations.size()
-    # trying different normalizations to handle contributions being different at different layers in the
-    # reference network, normalization for batch and channels handled outside this calculation
-    norm_factor = 1./(width*height)#/torch.numel(activations)
+    batch, channels, _, _ = activations.size()
+    # take the mean here to normalize the Gram matrix for later steps
+    norm_factor = 1./torch.numel(activations)
+    # calculate the Gram matrix
     flattened_activations = torch.reshape(activations, (batch*channels, -1,))
     gram_matrix = norm_factor*torch.matmul(flattened_activations, flattened_activations.t())
     return gram_matrix
@@ -39,16 +39,9 @@ def layerStyleLoss(pred_activations: torch.Tensor, target_activations: torch.Ten
     Activations must be 4-D tensors in (batch, channels, height, width) format."""
     if pred_activations.size()[0] != target_activations.size()[0] or pred_activations.size()[1] != target_activations.size()[1]:
         raise AttributeError("Both sets of activations must have the same number of channels and equal batch size.")
-    # print("activation tensor size:")
-    # print(pred_activations.size())
-    pred_gram = gramMatrix(pred_activations)
-    target_gram = gramMatrix(target_activations)
-    gram_diff = torch.sub(pred_gram, target_gram)
-    # using the sum creates much more drastic effect than taking the mean
-    # it's not clear which is better, size relative to the content loss at each layer is highly variable
-    #squared_frob_norm = torch.sum(torch.square(gram_diff))
-    squared_frob_norm = torch.mean(torch.square(gram_diff))
-    return squared_frob_norm
+    # use reduction='sum' because the Gram matrix was already divided by batch*channels*height*width
+    # using reduction='mean' will divide result by an additional (batch*channel)^2
+    return torch.nn.functional.mse_loss(gramMatrix(pred_activations), gramMatrix(target_activations), reduction='sum')
 
 
 class CustomDataset(data.Dataset):
@@ -256,51 +249,53 @@ class PerceptualLoss(_Loss):
         }
 
     def forward(self, preds, target):
-        #scale_factor = 1. # doesn't do anything important, just makes things more readable
         batch_loss = 0.
-        mse_reduce = 'mean'
+        mse_reduce = 'mean' # reduction method for the content loss calculated below
 
         # note class variables shouldn't normally be declared outside __init__ but i want to maximize ability
-        # to try new methodologies while I test and this is the easiest way to allow me to switch methods
+        # to try new methodologies while I test and this is the easiest way to allow me to switch
+        # between using single or multiple style targets
         style_index = randint(0, self.style_len-1)
         style_img = Image.open(self.style_dict[self.style_keys[style_index]]).convert('RGB')
         self.style_target = torch.unsqueeze(self.transforms(style_img).cuda(), dim=0)
 
-        # this is necessary for the Gram matrices to be calculated without flattening along the batch axis
-        batch_size, channel_num, _, _ = preds.size()
+        # repeating the style target is necessary for the Gram matrices to be calculated
+        # without flattening along the batch axis
+        batch_size, channel_num, width, height = preds.size()
         style_target = self.style_target.repeat(batch_size, 1, 1, 1)
 
-        # calculate the loss for the output of the network
-        output_style_loss = layerStyleLoss(preds, style_target) /(batch_size * channel_num) # *scale_factor/torch.numel(preds)
-        output_content_loss = torch.nn.functional.mse_loss(preds, target, reduction=mse_reduce) /(batch_size * channel_num) #*scale_factor/torch.numel(preds)
+        # calculate the losses at the output of the UNet
+        output_content_loss = torch.nn.functional.mse_loss(preds, target, reduction=mse_reduce)
+        output_style_loss = layerStyleLoss(preds, style_target)
         # print("content loss at output:")
         # print(output_content_loss)
         # print("style loss at output:")
         # print(output_style_loss)
         batch_loss += output_content_loss + output_style_loss
 
-        # add the weighted losses for the output from the reference model's layers
+        # calculate the losses for the output from the reference model's layers
         for layer in self.layers.keys():
             ref_target = self.ref_model[:layer+1](target)
             ref_preds = self.ref_model[:layer+1](preds)
             ref_style = self.ref_model[:layer+1](style_target)
-            batch_size, channel_num, _, _ = ref_preds.size()
-            ref_content_loss = torch.nn.functional.mse_loss(ref_preds, ref_target, reduction=mse_reduce) /(batch_size * channel_num) # *scale_factor/torch.numel(ref_preds)
-            ref_style_loss = layerStyleLoss(ref_preds, ref_style) /(batch_size * channel_num) # *scale_factor/torch.numel(ref_preds)
-            # print("layer " +  str(layer))
-            # print("content loss at layer " + str(layer))
-            # print(ref_content_loss)
+            batch_size, channel_num, width, height = ref_preds.size()
+            ref_content_loss = torch.nn.functional.mse_loss(ref_preds, ref_target, reduction=mse_reduce)
+            ref_style_loss = layerStyleLoss(ref_preds, ref_style)
             # print("style loss at layer" + str(layer))
             # print(ref_style_loss)
+            # print("content loss at layer " + str(layer))
+            # print(ref_content_loss)
             # multiplying by respective weights
-            batch_loss += self.layers[layer][0]*ref_content_loss + self.layers[layer][0]*ref_style_loss
+            batch_loss += self.layers[layer][0]*ref_style_loss + self.layers[layer][0]*ref_content_loss
 
         return batch_loss
 
 
 if __name__ == '__main__':
     num_epochs = 1000
-    # relevant directories
+    train_bs = 2
+    val_bs = 2
+    # directories where the images I'm using are stored
     # parent_path = r"C:\Users\Joe\Pictures\style_transfer\\"
     content_path = r"C:\Users\Joe\Pictures\style_transfer\content2\\"
     style_path = r"C:\Users\Joe\Pictures\style_transfer\style2\\"
@@ -313,8 +308,6 @@ if __name__ == '__main__':
     #print(net)
 
     # create the train and validation datasets
-    train_bs = 2
-    val_bs = 2
     trainset = CustomDataset(train_path)
     testset = CustomDataset(test_path)
     # create dataloaders from the datasets
