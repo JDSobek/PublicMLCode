@@ -1,5 +1,5 @@
 """Trying to make Torch ResNet code work with 3D convolutions to use with 2.5D models.
-Modified from Pytorch ResNet code.  Not really sure how well it works for anything other than Resnet18 and Resnet34"""
+Modified from Pytorch ResNet code."""
 
 
 import torch
