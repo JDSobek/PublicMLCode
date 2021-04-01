@@ -54,8 +54,8 @@ def CE_train_loop(data_loader, model, loss_fn, grad_optimizer, epoch_num, grad_s
         running_loss += loss.item()
         # explicitly clearing memory to prevent memory leaks
         del inputs, masks, outputs
-        if i % 10 == 9:
-            print('[Epoch %d, Batch %5d/' % (epoch_num + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss / 10))
+        if i % 5 == 4:
+            print('[Epoch %d, Batch %5d/' % (epoch_num + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss / 5))
             running_loss = 0.0
         # print('[Epoch %d, Batch %5d/' % (epoch + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss))
         # running_loss = 0.0
@@ -108,13 +108,13 @@ def train_loop(data_loader, model, loss_fn, grad_optimizer, epoch_num, lr_schedu
         running_loss += loss.item()
         # explicitly clearing memory to prevent memory leaks
         del inputs, masks, outputs
-        
-        # OneCycleLR steps after batch
+
+        # for learning rate schedulers like OneCycleLR that step after the batch
         if lr_scheduler is not None:
             lr_scheduler.step()
-        
-        if i % 10 == 9:
-            print('[Epoch %d, Batch %5d/' % (epoch_num + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss / 10))
+
+        if i % 5 == 4:
+            print('[Epoch %d, Batch %5d/' % (epoch_num + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss / 5))
             running_loss = 0.0
         # print('[Epoch %d, Batch %5d/' % (epoch + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss))
         # running_loss = 0.0
@@ -214,8 +214,7 @@ if __name__ == '__main__':
         val_loop(testloader, unetmodel, criterion, epoch)
         end = timer()
         print("Epoch duration: " + str(math.floor(end-begin)) + " seconds.")
-        # OneCycleLR steps after batch not at the end of the epoch
-        # didn't get to test this script after the fix
+        # one cycle needs to step after each batch not here at the end of the epoch
         #scheduler.step()
     print("Finished Training")
 
