@@ -8,7 +8,7 @@ from timeit import default_timer as timer
 from utils import *
 
 
-def CE_train_loop(data_loader, model, loss_fn, grad_optimizer, epoch_num, grad_scaler=None, augment = False):
+def CE_train_loop(data_loader, model, loss_fn, grad_optimizer, epoch_num, lr_scheduler=None, grad_scaler=None, augment = False):
     """Define the training loop.  Note training in function scope like this helps avoid CUDA OOM errors"""
     # set model in train mode
     model.train()
@@ -54,6 +54,9 @@ def CE_train_loop(data_loader, model, loss_fn, grad_optimizer, epoch_num, grad_s
         running_loss += loss.item()
         # explicitly clearing memory to prevent memory leaks
         del inputs, masks, outputs
+        # OneCycleLR steps after batch
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         if i % 10 == 9:
             print('[Epoch %d, Batch %5d/' % (epoch_num + 1, i + 1) + str(data_batches) + '] training loss: %.3f' % (running_loss / 10))
             running_loss = 0.0
@@ -205,11 +208,13 @@ if __name__ == '__main__':
     print("Beginning full model training")
     for epoch in range(train_epochs):
         begin = timer()
-        train_loop(trainloader, unetmodel, criterion, optimizer, epoch, scaler, augment=True)
+        train_loop(trainloader, unetmodel, criterion, optimizer, epoch, scheduler, scaler, augment=True)
         val_loop(testloader, unetmodel, criterion, epoch)
         end = timer()
         print("Epoch duration: " + str(math.floor(end-begin)) + " seconds.")
-        scheduler.step()
+        # OneCycleLR steps after batch not at the end of the epoch
+        # didn't get to test this script after the fix
+        #scheduler.step()
     print("Finished Training")
 
     if save_model:
