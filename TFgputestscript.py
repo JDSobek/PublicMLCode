@@ -9,6 +9,9 @@ from tensorflow.keras.layers import Dense, Conv2D, MaxPool2D, Flatten
 from tensorflow.keras.callbacks import EarlyStopping
 
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 (x_train, y_train), (x_test, y_test) = mnist.load_data()
 
 y_cat_test = to_categorical(y_test,10)
